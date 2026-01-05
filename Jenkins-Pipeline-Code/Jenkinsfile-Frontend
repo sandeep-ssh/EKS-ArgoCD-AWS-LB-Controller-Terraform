@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'nodejs'
+    }
+
+    environment {
+        SCANNER_HOME       = tool 'sonar-scanner'
+        AWS_ACCOUNT_ID     = credentials('ACCOUNT_ID')
+        AWS_ECR_REPO_NAME  = credentials('ECR_REPO1')
+        AWS_DEFAULT_REGION = 'us-east-1'
+        IMAGE_URI          = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${AWS_ECR_REPO_NAME}".toLowerCase()
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Source Code') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'GITHUB',
+                    url: 'https://github.com/sandeep-ssh/EKS-ArgoCD-AWS-LB-Controller-Terraform.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                dir('Application-Code/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-frontend \
+                        -Dsonar.projectKey=three-tier-frontend
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dir('Application-Code/frontend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                    odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+
+        stage('Verify Dockerfile') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh 'ls -l'
+                    script {
+                        if (!fileExists('Dockerfile')) {
+                            error "❌ Dockerfile not found in frontend directory"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh '''
+                        docker system prune -f
+                        docker build -t $IMAGE_URI:$BUILD_NUMBER .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+                    | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+                    docker push $IMAGE_URI:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh 'trivy image $IMAGE_URI:$BUILD_NUMBER > trivyimage.txt'
+            }
+        }
+
+        stage('Update Kubernetes Deployment') {
+            environment {
+                GIT_REPO_NAME = 'EKS-ArgoCD-AWS-LB-Controller-Terraform'
+                GIT_USER_NAME = 'sandeep-ssh'
+            }
+            steps {
+                dir('Kubernetes-Manifests-file/Frontend') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            git config user.email "sashcell@yahoo.co.in"
+                            git config user.name "sandeep-ssh"
+
+                            oldTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+
+                            sed -i "s|${AWS_ECR_REPO_NAME}:${oldTag}|${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}|g" deployment.yaml
+
+                            if git diff --quiet; then
+                                echo "No changes detected, skipping commit"
+                                exit 0
+                            fi
+
+                            git add deployment.yaml
+                            git commit -m "Update frontend image to ${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

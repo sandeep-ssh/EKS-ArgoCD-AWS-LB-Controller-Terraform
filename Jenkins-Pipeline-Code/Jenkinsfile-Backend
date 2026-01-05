@@ -1,0 +1,326 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID')
+        AWS_ECR_REPO_NAME = credentials('ECR_REPO2')
+        AWS_DEFAULT_REGION = 'us-east-1'
+    }
+
+    stages {
+
+        stage('Cleaning Workspace') {
+            steps { cleanWs() }
+        }
+
+        stage('Checkout from Git') {
+            steps {
+                script {
+                    def repoUrl = 'https://github.com/sandeep-ssh/EKS-ArgoCD-AWS-LB-Controller-Terraform.git'
+                    def gitCreds = 'GITHUB'
+                    def primaryBranch = 'main'
+                    def fallbackBranch = 'master'
+
+                    def branchExists = sh(script: "git ls-remote --heads ${repoUrl} ${primaryBranch} | wc -l", returnStdout: true).trim()
+                    if (branchExists.toInteger() > 0) {
+                        git branch: primaryBranch, credentialsId: gitCreds, url: repoUrl
+                    } else {
+                        branchExists = sh(script: "git ls-remote --heads ${repoUrl} ${fallbackBranch} | wc -l", returnStdout: true).trim()
+                        if (branchExists.toInteger() > 0) {
+                            git branch: fallbackBranch, credentialsId: gitCreds, url: repoUrl
+                        } else {
+                            error "❌ Neither '${primaryBranch}' nor '${fallbackBranch}' exist!"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Application-Code/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-frontend \
+                        -Dsonar.projectKey=three-tier-frontend
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Check') {
+            steps {
+                script { waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' }
+            }
+        }
+
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                    odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('Application-Code/frontend') { sh 'trivy fs . > trivyfs.txt' }
+            }
+        }
+
+        stage('Prepare Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${AWS_ECR_REPO_NAME}".toLowerCase()
+                    echo "Using Image URI: ${env.IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Check Dockerfile') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh 'echo "Files in frontend directory:" && ls -R'
+                    script {
+                        def dockerfile = sh(script: """
+                            if [ -f Dockerfile ]; then echo Dockerfile
+                            elif [ -f Dockerfile.dev ]; then echo Dockerfile.dev
+                            else echo NONE
+                            fi
+                        """, returnStdout: true).trim()
+                        if (dockerfile == 'NONE') { error "❌ No Dockerfile found!" }
+                        else { env.DOCKERFILE_NAME = dockerfile; echo "Using Dockerfile: ${dockerfile}" }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh '''
+                        docker system prune -f
+                        docker container prune -f
+
+                        # Legacy Docker build (no BuildKit)
+                        docker build -f $DOCKERFILE_NAME -t $IMAGE_URI:$BUILD_NUMBER .
+                    '''
+                }
+            }
+        }
+
+        stage('ECR Image Pushing') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+                    | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+                    docker push $IMAGE_URI:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('TRIVY Image Scan') {
+            steps {
+                sh 'trivy image $IMAGE_URI:$BUILD_NUMBER > trivyimage.txt'
+            }
+        }
+
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO_NAME = 'pipeline {
+    agent any
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID')
+        AWS_ECR_REPO_NAME = credentials('ECR_REPO1')
+        AWS_DEFAULT_REGION = 'us-east-1'
+    }
+
+    stages {
+
+        stage('Cleaning Workspace') {
+            steps { cleanWs() }
+        }
+
+        stage('Checkout from Git') {
+            steps {
+                script {
+                    def repoUrl = 'https://github.com/sandeep-ssh/EKS-ArgoCD-AWS-LB-Controller-Terraform.git'
+                    def gitCreds = 'GITHUB'
+                    def primaryBranch = 'main'
+                    def fallbackBranch = 'master'
+
+                    def branchExists = sh(script: "git ls-remote --heads ${repoUrl} ${primaryBranch} | wc -l", returnStdout: true).trim()
+                    if (branchExists.toInteger() > 0) {
+                        git branch: primaryBranch, credentialsId: gitCreds, url: repoUrl
+                    } else {
+                        branchExists = sh(script: "git ls-remote --heads ${repoUrl} ${fallbackBranch} | wc -l", returnStdout: true).trim()
+                        if (branchExists.toInteger() > 0) {
+                            git branch: fallbackBranch, credentialsId: gitCreds, url: repoUrl
+                        } else {
+                            error "❌ Neither '${primaryBranch}' nor '${fallbackBranch}' exist!"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Application-Code/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-frontend \
+                        -Dsonar.projectKey=three-tier-frontend
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Check') {
+            steps {
+                script { waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' }
+            }
+        }
+
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                    odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('Application-Code/frontend') { sh 'trivy fs . > trivyfs.txt' }
+            }
+        }
+
+        stage('Prepare Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${AWS_ECR_REPO_NAME}".toLowerCase()
+                    echo "Using Image URI: ${env.IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Check Dockerfile') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh 'echo "Files in frontend directory:" && ls -R'
+                    script {
+                        def dockerfile = sh(script: """
+                            if [ -f Dockerfile ]; then echo Dockerfile
+                            elif [ -f Dockerfile.dev ]; then echo Dockerfile.dev
+                            else echo NONE
+                            fi
+                        """, returnStdout: true).trim()
+                        if (dockerfile == 'NONE') { error "❌ No Dockerfile found!" }
+                        else { env.DOCKERFILE_NAME = dockerfile; echo "Using Dockerfile: ${dockerfile}" }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh '''
+                        docker system prune -f
+                        docker container prune -f
+
+                        # Legacy Docker build (no BuildKit)
+                        docker build -f $DOCKERFILE_NAME -t $IMAGE_URI:$BUILD_NUMBER .
+                    '''
+                }
+            }
+        }
+
+        stage('ECR Image Pushing') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+                    | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+                    docker push $IMAGE_URI:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('TRIVY Image Scan') {
+            steps {
+                sh 'trivy image $IMAGE_URI:$BUILD_NUMBER > trivyimage.txt'
+            }
+        }
+
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO_NAME = 'EKS-ArgoCD-AWS-LB-Controller-Terraform'
+                GIT_USER_NAME = 'sandeep-ssh'
+            }
+            steps {
+                dir('Kubernetes-Manifests-file/Frontend') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            git config user.email "sashcell@yahoo.co.in"
+                            git config user.name "sandeep-ssh"
+
+                            imageTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+                            sed -i "s/${AWS_ECR_REPO_NAME}:${imageTag}/${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}/" deployment.yaml
+
+                            git add deployment.yaml
+                            git commit -m "Update frontend image to ${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+
+    }
+}
+'
+                GIT_USER_NAME = 'sandeep-ssh'
+            }
+            steps {
+                dir('Kubernetes-Manifests-file/Frontend') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            git config user.email "sashcell@yahoo.co.in"
+                            git config user.name "sandeep-ssh"
+
+                            imageTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+                            sed -i "s/${AWS_ECR_REPO_NAME}:${imageTag}/${AWS_ECR_REPO_NAME}:${BUILD_NUMBER}/" deployment.yaml
+
+                            git add deployment.yaml
+                            git commit -m "Update frontend image to ${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+
+    }
+}
